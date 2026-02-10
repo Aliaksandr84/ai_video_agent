@@ -1,96 +1,80 @@
 import streamlit as st
-import requests
-from PIL import Image
-import io
+from figma_utils import list_top_frames, get_frame_image_url
+from openai_utils import visual_llm_extract
 
-st.title("Webcam DIAL Inference App + Agent & Enrichment")
+st.set_page_config(page_title="Figma ➜ Code Requirements Generator", layout='wide')
 
-# ---- Webcam and DIAL Inference ----
+st.title("Figma to Code/Requirements Generator (with Visual LLM)")
 
-img_file = st.camera_input("Take a snapshot!")
+st.sidebar.header("Figma Setup")
+figma_token = st.sidebar.text_input("Figma API Token", type="password")
+file_key = st.sidebar.text_input("Figma File Key (from file URL)")
+go_list = st.sidebar.button("List Frames")
 
-insight = None
+if 'frames' not in st.session_state:
+    st.session_state['frames'] = []
+if 'frame_images' not in st.session_state:
+    st.session_state['frame_images'] = {}
 
-if img_file:
-    img = Image.open(img_file)
-    st.image(img, caption="Your frame", use_column_width=True)
-
-    # Convert image to bytes
-    img_bytes = io.BytesIO()
-    img.save(img_bytes, format="JPEG")
-    img_bytes.seek(0)
-
-    with st.spinner("Running inference..."):
-        files = {'image': ('snapshot.jpg', img_bytes, 'image/jpeg')}
+if go_list and figma_token and file_key:
+    with st.spinner("Fetching Figma frames..."):
         try:
-            response = requests.post("http://localhost:5000/predict", files=files)
-            if response.ok:
-                insight = response.json()
-                st.success("AI Insight returned:")
-                st.json(insight)
-            else:
-                st.error("DIAL inference error.")
+            frames = list_top_frames(figma_token, file_key)
+            st.session_state.frames = frames
+            st.success(f"Found {len(frames)} frames")
         except Exception as e:
-            st.error(f"Error communicating with inference server: {e}")
+            st.error(f"Could not fetch frames: {e}")
+else:
+    frames = st.session_state.get('frames', [])
 
-# ---- Enrichment via Wikipedia API ----
+if frames:
+    selected = st.selectbox(
+        "Select frame to analyze", options=frames, format_func=lambda f: f"{f['page']} / {f['name']}"
+    )
+    if selected:
+        frame_id = selected['id']
+        if frame_id not in st.session_state['frame_images']:
+            with st.spinner("Getting frame image..."):
+                img_url = get_frame_image_url(figma_token, file_key, frame_id)
+                st.session_state['frame_images'][frame_id] = img_url
+        img_url = st.session_state['frame_images'][frame_id]
+        st.image(img_url, caption=f"Frame: {selected['name']} ({selected['page']})", use_column_width=True)
 
-def enrich_object_info(object_name):
-    """
-    Queries Wikipedia API for an object and returns the summary.
-    """
-    url = f"https://en.wikipedia.org/api/rest_v1/page/summary/{object_name}"
-    response = requests.get(url)
-    if response.ok:
-        data = response.json()
-        title = data.get('title', object_name)
-        desc = data.get('extract', 'No info found.')
-        page_url = data.get('content_urls', {}).get('desktop', {}).get('page', '')
-        return f"**{title}**\n\n{desc}\n\n[Read more]({page_url})"
-    return f"No information available for {object_name}."
+        # --- OpenAI Visual LLM integration ---
+        st.markdown("## Visual LLM Code/Requirement Extraction")
+        openai_key = st.text_input("OpenAI API Key", type="password", key="oai")
+        task = st.selectbox("Extraction task", [
+            "Generate requirements / user stories",
+            "Generate Streamlit UI code (Python)",
+            "Generate React component code"
+        ])
+        prompt = ""
+        if task == "Generate requirements / user stories":
+            prompt = "Please describe the requirements and main UI functionalities shown in this design image, suitable for agile development."
+        elif task == "Generate Streamlit UI code (Python)":
+            prompt = "Please generate Streamlit (Python) code that implements the visual layout in this image. Include basic interactivity if present."
+        else:
+            prompt = "Please generate a React component (JSX) implementing this layout with placeholder data and UI elements as appropriate."
 
+        if st.button("Send image to Visual LLM") and openai_key:
+            with st.spinner("Querying Visual LLM (GPT-4V)..."):
+                try:
+                    result = visual_llm_extract(img_url, prompt, openai_key)
+                    st.subheader("LLM Output:")
+                    st.code(result if "code" in task.lower() else "", language="python" if "Streamlit" in task else "jsx" if "React" in task else "")
+                    if not ("code" in task.lower()):
+                        st.markdown(result)
+                except Exception as e:
+                    st.error(f"LLM extraction failed: {e}")
+        st.info("Output can be adjusted or pasted directly into your codebase.")
 
-if insight and "objects" in insight:
-    st.header("Detected Objects and Enrichment")
-    for obj in insight["objects"]:
-        st.subheader(obj)
-        with st.spinner(f"Looking up {obj}..."):
-            enrich_info = enrich_object_info(obj)
-            st.markdown(enrich_info)
-elif insight:
-    st.info("No objects found in this frame for enrichment.")
+    # --- Optionally: Show all frames as gallery ---
+    with st.expander("Show all frames as gallery"):
+        for f in frames:
+            st.write(f"{f['page']} / {f['name']}")
+else:
+    st.markdown("➡️ Enter your Figma API token and File Key, then click **List Frames**.")
 
-# ---- Simple Chat Agent ----
-
-st.markdown("---")
-st.header("Ask the Analysis Agent 🧑‍💻")
-
-if 'agent_chat' not in st.session_state:
-    st.session_state.agent_chat = []
-
-user_input = st.text_input("Type your analysis question, suggestion, or prompt here:")
-
-if st.button("Send") and user_input:
-    # Simple agent logic with context
-    if insight and "objects" in insight and len(insight["objects"]) > 0:
-        detected_list = ", ".join(insight["objects"])
-        answer = (
-            f"In your latest snapshot, the detected objects are: {detected_list}.\n\n"
-            f"Use the enrichment section to learn more about them."
-        )
-    elif "how to" in user_input.lower():
-        answer = (
-            "You can capture a webcam image above. "
-            "After capturing, an AI summary and object enrichment will appear. "
-            "Try asking about specific objects in your scene!"
-        )
-    else:
-        answer = (
-            "I'm here to help with AI-based analysis. "
-            "Take a snapshot and I'll give you insights!"
-        )
-    st.session_state.agent_chat.append({"user": user_input, "agent": answer})
-
-for chat in st.session_state.agent_chat:
-    st.markdown(f"**You:** {chat['user']}")
-    st.markdown(f"**Agent:** {chat['agent']}")
+st.sidebar.markdown("---")
+st.sidebar.markdown("Get Figma tokens at https://www.figma.com/developers/api")
+st.sidebar.markdown("Get file key from the file URL: https://www.figma.com/file/**FILE_KEY**/...")
